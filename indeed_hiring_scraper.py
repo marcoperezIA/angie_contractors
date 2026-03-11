@@ -39,6 +39,11 @@ LOCATIONS = [
     "San Jose, CA",
     "Alameda, CA",
     "Oakland, CA",
+    "Miami, FL",
+    "Miami Beach, FL",
+    "Hialeah, FL",
+    "Fort Lauderdale, FL",
+    "Brickell, FL",
 ]
 
 
