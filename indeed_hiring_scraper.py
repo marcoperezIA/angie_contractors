@@ -16,8 +16,8 @@ from playwright_stealth import Stealth
 
 OUTPUT_FILE = "hiring_companies.csv"
 FIELDNAMES = [
-    "company", "phone", "website", "job_title", "location",
-    "salary", "description", "source", "job_url",
+    "company", "phone", "email", "linkedin_profile", "website",
+    "job_title", "location", "salary", "description", "source", "job_url",
 ]
 
 SEARCH_QUERIES = [
@@ -63,14 +63,19 @@ def get_saved_urls():
 
 
 def get_saved_companies_info():
-    """Cache de phone/website ya encontrados para no buscar de nuevo."""
+    """Cache de phone/email/linkedin/website ya encontrados para no buscar de nuevo."""
     info = {}
     if os.path.exists(OUTPUT_FILE) and os.path.getsize(OUTPUT_FILE) > 0:
         with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 c = row.get("company", "")
-                if c and (row.get("phone") or row.get("website")):
-                    info[c] = {"phone": row.get("phone", ""), "website": row.get("website", "")}
+                if c and (row.get("phone") or row.get("website") or row.get("email")):
+                    info[c] = {
+                        "phone": row.get("phone", ""),
+                        "email": row.get("email", ""),
+                        "linkedin_profile": row.get("linkedin_profile", ""),
+                        "website": row.get("website", ""),
+                    }
     return info
 
 
@@ -90,25 +95,21 @@ def extract_phone_from_html(html):
     # 1. Links tel: (más confiable)
     for tel_link in soup.find_all("a", href=re.compile(r"^tel:")):
         num = tel_link["href"].replace("tel:", "").strip()
-        # Limpiar caracteres no numéricos excepto + al inicio
         clean = re.sub(r"[^\d+]", "", num)
         if len(clean) >= 10:
             return num
 
     # 2. Buscar en texto cerca de palabras clave de contacto
     text = soup.get_text(" ", strip=True)
-
-    # Buscar teléfono cerca de "phone", "call", "tel", "contact"
     phone_pattern = r"\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}"
     contact_pattern = r"(?:phone|call|tel|contact|reach)[\s:.\-]*(?:us)?[\s:.\-]*" + phone_pattern
     m = re.search(contact_pattern, text, re.IGNORECASE)
     if m:
-        # Extraer solo el número del match
         num_match = re.search(phone_pattern, m.group(0))
         if num_match:
             return num_match.group(0)
 
-    # 3. Fallback: primer teléfono en el texto (menos confiable)
+    # 3. Fallback: primer teléfono en el texto
     m = re.search(phone_pattern, text)
     if m:
         return m.group(0)
@@ -116,12 +117,55 @@ def extract_phone_from_html(html):
     return ""
 
 
+def extract_email_from_html(html):
+    """Extrae email de HTML - primero mailto: links, luego regex."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. Links mailto: (más confiable)
+    for mailto in soup.find_all("a", href=re.compile(r"^mailto:")):
+        email = mailto["href"].replace("mailto:", "").split("?")[0].strip()
+        if "@" in email and "." in email:
+            # Ignorar emails genéricos de plataformas
+            if not any(s in email.lower() for s in ["noreply", "no-reply", "donotreply", "example.com"]):
+                return email
+
+    # 2. Regex en el texto
+    text = soup.get_text(" ", strip=True)
+    m = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
+    if m:
+        email = m.group(0)
+        if not any(s in email.lower() for s in ["noreply", "no-reply", "donotreply", "example.com"]):
+            return email
+
+    return ""
+
+
+def extract_linkedin_from_html(html, company_name):
+    """Extrae perfil de LinkedIn de empresa desde el HTML del website."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Buscar links a linkedin.com/company/...
+    for a in soup.find_all("a", href=re.compile(r"linkedin\.com/company/", re.IGNORECASE)):
+        href = a["href"]
+        # Normalizar URL
+        if not href.startswith("http"):
+            href = "https://" + href.lstrip("/")
+        # Limpiar parámetros
+        href = href.split("?")[0].rstrip("/")
+        if "/company/" in href:
+            return href
+
+    return ""
+
+
 def search_company_contact(contact_page, company_name, company_cache):
-    """Busca website en DuckDuckGo, luego visita /contact del site para phone."""
+    """Busca website en DuckDuckGo, luego visita /contact del site para phone/email/linkedin."""
     if company_name in company_cache:
         return company_cache[company_name]
 
     phone = ""
+    email = ""
+    linkedin_profile = ""
     website = ""
 
     # Paso 1: Buscar website en DuckDuckGo
@@ -136,7 +180,6 @@ def search_company_contact(contact_page, company_name, company_cache):
         html = contact_page.content()
         soup = BeautifulSoup(html, "html.parser")
 
-        # Buscar primer link real
         for a in soup.find_all("a", href=True):
             h = a["href"]
             if h.startswith("http") and not any(s in h.lower() for s in SKIP_DOMAINS):
@@ -151,32 +194,38 @@ def search_company_contact(contact_page, company_name, company_cache):
     except Exception:
         pass
 
-    # Paso 2: Visitar la página de contacto de la empresa
+    # Paso 2: Visitar /contact y homepage para sacar phone, email y linkedin
     if website:
         base = website.rstrip("/")
         parsed = urlparse(base)
         base_domain = f"{parsed.scheme}://{parsed.netloc}"
 
-        # Intentar /contact primero, luego homepage
-        contact_urls = [
+        pages_to_check = [
             f"{base_domain}/contact",
             f"{base_domain}/contact-us",
             base,
         ]
 
-        for curl in contact_urls:
+        for curl in pages_to_check:
             try:
                 contact_page.goto(curl, wait_until="domcontentloaded", timeout=10000)
                 contact_page.wait_for_timeout(800)
-
                 site_html = contact_page.content()
-                phone = extract_phone_from_html(site_html)
-                if phone:
+
+                if not phone:
+                    phone = extract_phone_from_html(site_html)
+                if not email:
+                    email = extract_email_from_html(site_html)
+                if not linkedin_profile:
+                    linkedin_profile = extract_linkedin_from_html(site_html, company_name)
+
+                # Si ya tenemos todo, parar
+                if phone and email and linkedin_profile:
                     break
             except Exception:
                 continue
 
-    result = {"phone": phone, "website": website}
+    result = {"phone": phone, "email": email, "linkedin_profile": linkedin_profile, "website": website}
     company_cache[company_name] = result
     return result
 
@@ -234,12 +283,13 @@ def scrape_indeed(job_page, contact_page, query, location, saved_urls, company_c
                     job_url = f"https://www.indeed.com/viewjob?jk={jk}" if jk else ""
 
                 if company and title and job_url and job_url not in saved_urls:
-                    # Buscar phone y website en la OTRA pestaña
                     contact = search_company_contact(contact_page, company, company_cache)
 
                     row = {
                         "company": company,
                         "phone": contact["phone"],
+                        "email": contact["email"],
+                        "linkedin_profile": contact["linkedin_profile"],
                         "website": contact["website"],
                         "job_title": title,
                         "location": loc,
@@ -253,7 +303,7 @@ def scrape_indeed(job_page, contact_page, query, location, saved_urls, company_c
                     saved_urls.add(job_url)
                     new_count += 1
 
-                    print(f"\n      {company} -> {contact['phone'] or '---'}", end="")
+                    print(f"\n      {company} | ph:{contact['phone'] or '-'} | em:{contact['email'] or '-'} | li:{contact['linkedin_profile'] or '-'}", end="")
 
             except Exception:
                 continue
@@ -323,6 +373,8 @@ def scrape_glassdoor(job_page, contact_page, query, location, saved_urls, compan
                     row = {
                         "company": company,
                         "phone": contact["phone"],
+                        "email": contact["email"],
+                        "linkedin_profile": contact["linkedin_profile"],
                         "website": contact["website"],
                         "job_title": title,
                         "location": loc,
@@ -406,6 +458,8 @@ def scrape_linkedin(job_page, contact_page, query, location, saved_urls, company
                     row = {
                         "company": company,
                         "phone": contact["phone"],
+                        "email": contact["email"],
+                        "linkedin_profile": contact["linkedin_profile"],
                         "website": contact["website"],
                         "job_title": title,
                         "location": loc,
